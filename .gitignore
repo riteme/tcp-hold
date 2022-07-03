@@ -4,3 +4,7 @@ compile_commands.json
 
 main
 lockstep
+test
+
+*.o
+*.skel.h

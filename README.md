@@ -1,4 +1,8 @@
-# Notes
+## Notes
+
+- libbpf tc 支持
+
+https://patchwork.kernel.org/project/netdevbpf/patch/20210512103451.989420-3-memxor@gmail.com/
 
 - 在新的 netns 内无法使用 `ping`，`ping` 没有任何输出就退出
 

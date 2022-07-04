@@ -12,15 +12,19 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 
 std::vector<std::function<void()>> defer;
 
-static void signal_handler(int) {
+static void exit_handler() {
     puts("Exiting...");
     for (auto fn = defer.rbegin(); fn != defer.rend(); fn++) {
         (*fn)();
     }
+}
+
+static void signal_handler(int) {
     exit(0);
 }
 
 int main() {
+    atexit(exit_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
@@ -72,11 +76,13 @@ int main() {
         printf("mode = ");
         scanf("%d", &skel->bss->mode);
 
-        for (int i = 0; i < 3; i++) {
+        int k, *kp = NULL;
+        while (bpf_map__get_next_key(skel->maps.count_map, kp, &k, sizeof(k)) != -ENOENT) {
+            kp = &k;
             uint64_t v;
-            if (bpf_map__lookup_elem(skel->maps.count_map, &i, sizeof(i), &v, sizeof(v), 0) < 0)
+            if (bpf_map__lookup_elem(skel->maps.count_map, &k, sizeof(k), &v, sizeof(v), 0) < 0)
                 v = 0;
-            printf("count[%d]=%lu\n", i, v);
+            printf("count[%d]=%lu\n", k, v);
         }
     }
 }

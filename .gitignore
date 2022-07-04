@@ -2,6 +2,7 @@
 
 compile_commands.json
 
+vmlinux.h
 main
 lockstep
 test

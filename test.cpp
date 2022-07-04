@@ -1,5 +1,8 @@
-#include <iostream>
+#include <signal.h>
 #include <net/if.h>
+
+#include <vector>
+#include <functional>
 
 #include "test.skel.h"
 
@@ -7,7 +10,19 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	return vfprintf(stderr, format, args);
 }
 
+std::vector<std::function<void()>> defer;
+
+static void signal_handler(int) {
+    puts("Exiting...");
+    for (auto fn = defer.rbegin(); fn != defer.rend(); fn++) {
+        (*fn)();
+    }
+    exit(0);
+}
+
 int main() {
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
     libbpf_set_print(libbpf_print_fn);
 
@@ -16,6 +31,9 @@ int main() {
         fprintf(stderr, "Failed to open BPF prgoram. errno=%d\n", errno);
         return -1;
     }
+    defer.push_back([skel] {
+        test::destroy(skel);
+    });
 
     skel->bss->mode = 0;
 
@@ -37,6 +55,10 @@ int main() {
         fprintf(stderr, "Failed to create tc hook. errno=%d\n", errno);
         return -1;
     }
+    defer.push_back([hook]() mutable {
+        hook.attach_point = static_cast<enum bpf_tc_attach_point>(BPF_TC_INGRESS | BPF_TC_EGRESS);
+        bpf_tc_hook_destroy(&hook);
+    });
 
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts,
         .prog_fd = bpf_program__fd(skel->progs.tc_main),
@@ -47,8 +69,14 @@ int main() {
     }
 
     while (true) {
-        std::cin >> skel->bss->mode;
-    }
+        printf("mode = ");
+        scanf("%d", &skel->bss->mode);
 
-    return 0;
+        for (int i = 0; i < 3; i++) {
+            uint64_t v;
+            if (bpf_map__lookup_elem(skel->maps.count_map, &i, sizeof(i), &v, sizeof(v), 0) < 0)
+                v = 0;
+            printf("count[%d]=%lu\n", i, v);
+        }
+    }
 }

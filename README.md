@@ -1,4 +1,33 @@
+## Prerequisites
+
+- Linux kernel 5.18.6
+- libbpf 0.8.0
+- libnl 3.6.0
+- clang 13.0.1
+
+## Run
+
+Server:
+
+```
+make
+./demo server 32 ping 16 0.0.0.0:23324
+```
+
+Client:
+
+```
+sudo ./net-up.sh
+sudo ip netns exec ns0 sudo -u $(whoami) bash
+make
+sudo HOOK=1 ./demo client 32 echo 16 192.168.100.100:23324
+```
+
 ## Notes
+
+- `bpf_map_update_elem` sometimes returns `-EBUSY`
+
+不知道原因，但貌似重试一下就好了。
 
 - WLAN packet
 

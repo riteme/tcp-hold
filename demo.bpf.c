@@ -53,6 +53,14 @@ struct {
     __type(value, __u32);
 } syn_map;
 
+SEC(".maps")
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct tcp_key);
+    __type(value, __u32);
+} ack_map;
+
 SEC("tc")
 int ingress_main(struct __sk_buff *skb) {
     struct tcphdr *tcp;
@@ -60,7 +68,7 @@ int ingress_main(struct __sk_buff *skb) {
     if (parse_header(&tcp, &key, skb) < 0)
         goto out;
 
-    if (tcp->syn && tcp->ack) {
+    if (tcp->syn) {
         __u32 v = bpf_ntohl(tcp->seq);
         bpf_map_update_elem(&syn_map, &key, &v, BPF_ANY);
     }
@@ -79,6 +87,13 @@ int egress_main(struct __sk_buff *skb) {
     if (tcp->syn) {
         __u32 v = bpf_ntohl(tcp->seq);
         bpf_map_update_elem(&syn_map, &key, &v, BPF_ANY);
+    }
+
+    __u32 *ack_seq;
+    if (tcp->ack && (ack_seq = bpf_map_lookup_elem(&ack_map, &key))) {
+        __u32 offset = (__u32)(__u64)tcp - skb->data + offsetof(struct tcphdr, ack_seq);
+        __u32 value = bpf_htonl(*ack_seq);
+        bpf_skb_store_bytes(skb, offset, &value, sizeof(value), BPF_F_RECOMPUTE_CSUM);
     }
 
 out:

@@ -26,7 +26,7 @@ $(BPF_SKELETONS) : %.skel.h : %.o
 	bpftool gen skeleton $< > $@
 
 $(BPF_TARGETS) : % : %.cpp %.skel.h defines.h
-	g++ $(LIBBPF_FLAGS) $< -o $@
+	g++ $(LIBBPF_FLAGS) -O2 $< -o $@
 
 .PHONY: clean
 clean:

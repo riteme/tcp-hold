@@ -23,6 +23,16 @@ make
 sudo HOOK=1 ./demo client 32 echo 16 192.168.100.100:23324
 ```
 
+See `demo.cpp` and `demo.bpf.c`.
+
+## TODO
+
+- [ ] Request latency
+- [ ] Request hroughput
+- [ ] #TCP-retransmission
+- [ ] Syscall latency
+- [ ] CPU usage
+
 ## Notes
 
 - `bpf_map_update_elem` sometimes returns `-EBUSY`

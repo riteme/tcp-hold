@@ -19,13 +19,13 @@ main: main.cpp
 lockstep: lockstep.cpp
 	g++ $(LIBNL3_FLAGS) $< -o $@
 
-$(BPF_OBJECTS) : %.o : %.bpf.c
+$(BPF_OBJECTS) : %.o : %.bpf.c defines.h
 	clang --target=bpf -O2 -g -Wall -c -o $@ $<
 
 $(BPF_SKELETONS) : %.skel.h : %.o
 	bpftool gen skeleton $< > $@
 
-$(BPF_TARGETS) : % : %.cpp %.skel.h
+$(BPF_TARGETS) : % : %.cpp %.skel.h defines.h
 	g++ $(LIBBPF_FLAGS) $< -o $@
 
 .PHONY: clean

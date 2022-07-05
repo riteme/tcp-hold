@@ -4,102 +4,104 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include <vector>
-#include <functional>
-
+#include "defines.h"
 #include "demo.skel.h"
 
-static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
-	return vfprintf(stderr, format, args);
+#define fatal(...) { \
+    fprintf(stderr, __VA_ARGS__); \
+    exit(-1); \
 }
 
-std::vector<std::function<void()>> defer;
+struct Monitor {
+    static constexpr auto BOTH_DIRECTION = static_cast<enum bpf_tc_attach_point>(
+        BPF_TC_INGRESS | BPF_TC_EGRESS
+    );
+
+    static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
+        return vfprintf(stderr, format, args);
+    }
+
+    struct demo *skel = NULL;
+    struct bpf_tc_hook hook = {
+        .sz = sizeof(hook),
+    };
+
+    void realize() {
+        libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
+        libbpf_set_print(libbpf_print_fn);
+
+        skel = demo::open();
+        if (!skel)
+            fatal("Failed to open BPF prgoram. errno=%d\n", errno);
+        if (demo::load(skel) < 0)
+            fatal("Failed to load BPF program. errno=%d\n", errno);
+
+        hook.ifindex = if_nametoindex("inner0");
+        if (hook.ifindex == 0)
+            fatal("Failed to get ifindex. errno=%d\n", errno);
+        hook.attach_point = BOTH_DIRECTION;
+        if (bpf_tc_hook_create(&hook) < 0)
+            fatal("Failed to create tc hook. errno=%d\n", errno);
+
+        struct bpf_tc_opts opts = {0};
+        opts.sz = sizeof(opts);
+        hook.attach_point = BPF_TC_INGRESS;
+        opts.prog_fd = bpf_program__fd(skel->progs.ingress_main);
+        if (bpf_tc_attach(&hook, &opts) < 0)
+            fatal("Failed to attach ingress BPF program. errno=%d\n", errno);
+
+        memset(&opts, 0, sizeof(opts));
+        opts.sz = sizeof(opts);
+        hook.attach_point = BPF_TC_EGRESS;
+        opts.prog_fd = bpf_program__fd(skel->progs.egress_main);
+        if (bpf_tc_attach(&hook, &opts) < 0)
+            fatal("Failed to attach egress BPF program. errno=%d\n", errno);
+    }
+
+    void finalize() {
+        if (hook.ifindex != 0) {
+            hook.attach_point = BOTH_DIRECTION;
+            bpf_tc_hook_destroy(&hook);
+        }
+        if (skel)
+            demo::destroy(skel);
+    }
+};
+
+static Monitor mon;
 
 static void exit_handler() {
     puts("Exiting...");
-    for (auto fn = defer.rbegin(); fn != defer.rend(); fn++) {
-        (*fn)();
-    }
+    mon.finalize();
 }
 
 static void signal_handler(int) {
     exit(0);
 }
 
-static void attach_program(
-    struct bpf_tc_hook *hook,
-    struct bpf_program *program
-) {
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts,
-        .prog_fd = bpf_program__fd(program),
-    );
-    if (bpf_tc_attach(hook, &opts) < 0) {
-        fprintf(stderr, "Failed to attach BPF program. errno=%d\n", errno);
-        exit(-1);
-    }
-}
-
 int main() {
     atexit(exit_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
-    libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
-    libbpf_set_print(libbpf_print_fn);
 
-    struct demo *skel = demo::open();
-    if (!skel) {
-        fprintf(stderr, "Failed to open BPF prgoram. errno=%d\n", errno);
-        return -1;
-    }
-    defer.push_back([skel] {
-        demo::destroy(skel);
-    });
-
-    if (demo::load(skel) < 0) {
-        fprintf(stderr, "Failed to load BPF program. errno=%d\n", errno);
-        return -1;
-    }
-
-    int index = if_nametoindex("inner0");
-    if (index == 0) {
-        fprintf(stderr, "Failed to get ifindex. errno=%d\n", errno);
-        return -1;
-    }
-
-    enum bpf_tc_attach_point both = static_cast<enum bpf_tc_attach_point>(BPF_TC_INGRESS | BPF_TC_EGRESS);
-    DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook,
-        .ifindex = index,
-        .attach_point = both,
-    );
-    if (bpf_tc_hook_create(&hook) < 0) {
-        fprintf(stderr, "Failed to create tc hook. errno=%d\n", errno);
-        exit(-1);
-    }
-    defer.push_back([hook]() mutable {
-        bpf_tc_hook_destroy(&hook);
-    });
-
-    hook.attach_point = BPF_TC_INGRESS;
-    attach_program(&hook, skel->progs.ingress_main);
-    hook.attach_point = BPF_TC_EGRESS;
-    attach_program(&hook, skel->progs.egress_main);
+    mon.realize();
 
     while (true) {
         sleep(1);
 
-        struct bpf_sock_tuple k;
-        while (bpf_map__get_next_key(skel->maps.syn_map, NULL, &k, sizeof(k)) != -ENOENT) {
+        struct tcp_key k;
+        while (bpf_map__get_next_key(mon.skel->maps.syn_map, NULL, &k, sizeof(k)) != -ENOENT) {
             __u32 v;
-            if (bpf_map__lookup_and_delete_elem(skel->maps.syn_map, &k, sizeof(k), &v, sizeof(v), 0) < 0)
+            if (bpf_map__lookup_and_delete_elem(mon.skel->maps.syn_map, &k, sizeof(k), &v, sizeof(v), 0) < 0)
                 v = 0;
 
             char src[32], dst[32];
-            strcpy(src, inet_ntoa((struct in_addr){k.ipv4.saddr}));
-            strcpy(dst, inet_ntoa((struct in_addr){k.ipv4.daddr}));
+            strcpy(src, inet_ntoa((struct in_addr){k.saddr}));
+            strcpy(dst, inet_ntoa((struct in_addr){k.daddr}));
             printf(
                 "%s:%d -> %s:%d @%u\n",
-                src, ntohs(k.ipv4.sport),
-                dst, ntohs(k.ipv4.dport),
+                src, ntohs(k.sport),
+                dst, ntohs(k.dport),
                 v
             );
         }

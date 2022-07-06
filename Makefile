@@ -5,7 +5,7 @@ BPF_TARGETS = test demo
 BPF_OBJECTS = $(addsuffix .o,$(BPF_TARGETS))
 BPF_SKELETONS = $(addsuffix .skel.h,$(BPF_TARGETS))
 
-TARGETS = main lockstep \
+TARGETS = main lockstep demo-nobpf \
 	$(BPF_OBJECTS) \
 	$(BPF_SKELETONS) \
 	$(BPF_TARGETS)
@@ -14,7 +14,7 @@ TARGETS = main lockstep \
 all: $(TARGETS)
 
 main: main.cpp
-	g++ -std=c++11 -lpthread -O2 main.cpp -o main
+	g++ -std=c++11 -O2 main.cpp -o main -lpthread
 
 lockstep: lockstep.cpp
 	g++ $(LIBNL3_FLAGS) $< -o $@
@@ -27,6 +27,9 @@ $(BPF_SKELETONS) : %.skel.h : %.o
 
 $(BPF_TARGETS) : % : %.cpp %.skel.h defines.h
 	g++ $(LIBBPF_FLAGS) -O2 $< -o $@
+
+demo-nobpf: demo.cpp
+	g++ -std=c++11 -O2 -DDEMO_NO_BPF $< -o $@ -lpthread
 
 .PHONY: clean
 clean:

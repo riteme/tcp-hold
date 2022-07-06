@@ -6,6 +6,7 @@ main
 lockstep
 test
 demo
+demo-nobpf
 
 *.o
 *.skel.h

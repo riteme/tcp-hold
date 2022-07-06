@@ -35,6 +35,12 @@ See `demo.cpp` and `demo.bpf.c`.
 
 ## Notes
 
+- TCP timed-wait && SIGPIPE
+
+设置 `SO_LINGER` 可以强制发送 `RST` 而不是常规的 `FIN`，避免 TCP 连接进入 timed-wait 状态。
+
+当 socket 被关闭后，`write`/`send` 会触发 `SIGPIPE` 信号。忽略即可。
+
 - `bpf_map_update_elem` sometimes returns `-EBUSY`
 
 不知道原因，但貌似重试一下就好了。

@@ -10,6 +10,7 @@
 #include <thread>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <condition_variable>
 
 #include <signal.h>
@@ -19,19 +20,18 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <linux/types.h>
 
+// #define DEMO_NO_BPF
+
+#ifndef DEMO_NO_BPF
 #include "defines.h"
 #include "demo.skel.h"
-
-static void safe_exit(int v) {
-    static std::mutex exit_mutex;
-    exit_mutex.lock();
-    exit(v);
-}
+#endif
 
 #define fatal(...) { \
     fprintf(stderr, __VA_ARGS__); \
-    safe_exit(-1); \
+    exit(-1); \
 }
 
 static inline __u64 get_ts() {
@@ -40,29 +40,34 @@ static inline __u64 get_ts() {
     ).count();
 }
 
+#ifndef DEMO_NO_BPF
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     return vfprintf(stderr, format, args);
 }
-
-static int env_hook = 0;
+#endif
 
 struct Monitor {
+#ifndef DEMO_NO_BPF
     static constexpr auto both_directions = static_cast<enum bpf_tc_attach_point>(
         BPF_TC_INGRESS | BPF_TC_EGRESS
     );
+#endif
 
     struct Socket {
         static constexpr size_t initial_buffer_size = 4096;
 
         Monitor &mon;
+#ifndef DEMO_NO_BPF
         struct tcp_key ingress_key;
         struct tcp_key egress_key;
+#endif
         int fd;
         __u32 initial_recv_seq = 0;
         __u32 num_bytes_read = 0;
         size_t beg = 0, end = 0;
         std::vector<__u8> buffer;
 
+#ifndef DEMO_NO_BPF
         void set_ack_seq(__u32 ack_seq) {
             int ret = 0;
             do {
@@ -70,16 +75,17 @@ struct Monitor {
                     mon.skel->maps.ack_map, &egress_key, sizeof(egress_key), &ack_seq, sizeof(ack_seq), BPF_ANY
                 );
             } while (ret == -EBUSY);
-            if (ret < 0)
+            if (ret < 0) {
                 fprintf(stderr, "Failed to set ack sequence number. errno=%d\n", errno);
+                throw std::runtime_error("set_ack_seq");
+            }
         }
+#endif
 
         Socket(Monitor &_mon, int _fd) : mon(_mon), fd(_fd) {
             buffer.resize(initial_buffer_size);
 
-            if (!env_hook)
-                return;
-
+#ifndef DEMO_NO_BPF
             struct sockaddr_in addr;
             socklen_t len = sizeof(addr);
             getpeername(fd, (struct sockaddr *)&addr, &len);
@@ -95,7 +101,7 @@ struct Monitor {
                 ) < 0)
                 fatal("Failed to get initial recv sequence number. errno=%d\n", errno);
             initial_recv_seq = v;
-            printf("initial_recv_seq=%u\n", initial_recv_seq);
+            // printf("initial_recv_seq=%u\n", initial_recv_seq);
 
             egress_key = ingress_key;
             std::swap(egress_key.saddr, egress_key.daddr);
@@ -103,10 +109,7 @@ struct Monitor {
             bpf_map__delete_elem(mon.skel->maps.syn_map, &egress_key, sizeof(egress_key), 0);
 
             set_ack_seq(initial_recv_seq + 1);
-        }
-
-        ~Socket() {
-            finalize();
+#endif
         }
 
         void write(const void *data, size_t size) {
@@ -114,9 +117,11 @@ struct Monitor {
             for (size_t i = 0; i < size; ) {
                 int ret = send(fd, ptr + i, size - i, 0);
                 if (ret < 0)
-                    fatal("Failed to write to socket. errno=%d\n", errno);
+                    throw std::runtime_error("send");
+                    // fatal("Failed to write to socket. errno=%d\n", errno);
                 i += ret;
             }
+            mon.outbound_acc.fetch_add(size, std::memory_order_relaxed);
         }
 
         auto read(size_t size) -> const void * {
@@ -140,21 +145,21 @@ struct Monitor {
             while (size > end - beg) {
                 int ret = recv(fd, buffer.data() + end, buffer.size() - end, 0);
                 if (ret < 0)
-                    fatal("Failed to read from socket. errno=%d\n", errno);
+                    throw std::runtime_error("recv");
+                    // fatal("Failed to read from socket. errno=%d\n", errno);
+                if (ret == 0)
+                    throw std::runtime_error("recv: shutdown");
                 end += ret;
             }
 
             const void *ptr = buffer.data() + beg;
             beg += size;
             num_bytes_read += size;
-            if (env_hook)
-                set_ack_seq(initial_recv_seq + num_bytes_read);
+#ifndef DEMO_NO_BPF
+            set_ack_seq(initial_recv_seq + num_bytes_read);
+#endif
+            mon.inbound_acc.fetch_add(size, std::memory_order_relaxed);
             return ptr;
-        }
-
-        void finalize() {
-            shutdown(fd, SHUT_RDWR);
-            close(fd);
         }
     };
 
@@ -162,7 +167,7 @@ struct Monitor {
 
     struct Histogram {
         static constexpr int num_buckets = 65536;
-        static constexpr int bucket_width = 512;
+        static constexpr int bucket_width = 1;
 
         std::atomic<__u64> bucket[num_buckets];
 
@@ -183,8 +188,13 @@ struct Monitor {
         }
     };
 
+#ifndef DEMO_NO_BPF
     struct demo *skel = NULL;
     int ifindex;
+    struct bpf_tc_hook hook = {
+        .sz = sizeof(hook),
+    };
+#endif
     std::list<int> fds;
     std::list<SocketPtr> socks;
     Histogram latency;
@@ -192,9 +202,7 @@ struct Monitor {
     std::atomic<__u64> outbound_acc;
 
     void realize() {
-        if (!env_hook)
-            return;
-
+#ifndef DEMO_NO_BPF
         libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
         libbpf_set_print(libbpf_print_fn);
 
@@ -208,10 +216,8 @@ struct Monitor {
         if (ifindex == 0)
             fatal("Failed to get ifindex. errno=%d\n", errno);
 
-        DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook,
-            .ifindex = ifindex,
-            .attach_point = both_directions,
-        );
+        hook.ifindex = ifindex;
+        hook.attach_point = both_directions;
         if (bpf_tc_hook_create(&hook) < 0)
             fatal("Failed to create tc hook. errno=%d\n", errno);
 
@@ -228,26 +234,26 @@ struct Monitor {
         opts.prog_fd = bpf_program__fd(skel->progs.egress_main);
         if (bpf_tc_attach(&hook, &opts) < 0)
             fatal("Failed to attach egress BPF program. errno=%d\n", errno);
+#endif
     }
 
     void finalize() {
+        for (auto &sock : socks) {
+            shutdown(sock->fd, SHUT_RDWR);
+            close(sock->fd);
+        }
         for (int fd : fds) {
             close(fd);
         }
-        for (auto &sock : socks) {
-            sock->finalize();
-        }
 
+#ifndef DEMO_NO_BPF
         if (skel) {
-            // TODO: Sometimes atexit doesn't arrive here.
-            DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook,
-                .ifindex = ifindex,
-                .attach_point = both_directions,
-            );
+            hook.attach_point = both_directions;
             if (bpf_tc_hook_destroy(&hook) < 0)
                 fprintf(stderr, "Failed to destroy tc hook. errno=%d\n", errno);
             demo::destroy(skel);
         }
+#endif
     }
 
     auto attach(int fd) -> SocketPtr {
@@ -255,7 +261,7 @@ struct Monitor {
         return socks.back();
     }
 
-    void main() {
+    void run(int num_iters, const std::string &name) {
         double ts_0, ts_1, ts_2;
         __u64 acc[latency.num_buckets + 1], delta[latency.num_buckets + 1];
         __u64 inbound_acc_1, inbound_acc_2;
@@ -274,7 +280,13 @@ struct Monitor {
 
         fetch();
         ts_0 = ts_2;
-        while (true) {
+        double avg_pkts_sum = 0;
+        double p50_sum = 0;
+        double p99_sum = 0;
+        double in_tput_sum = 0;
+        double out_tput_sum = 0;
+        double num_samples = 0;
+        for (int t = 0; t < num_iters; t++) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
 
             auto begin_ts = get_ts();
@@ -306,7 +318,26 @@ struct Monitor {
                 "[%.1lfs] %.1lf pkts/s, p50 %.3lf ms, p99 %.3lf ms, in %.2lf MiB/s, out %.2lf MiB/s\n",
                 ts_2 - ts_0, avg_pkts, p50, p99, in_tput, out_tput
             );
+
+            if (t >= 5 && t + 5 < num_iters) {
+                avg_pkts_sum += avg_pkts;
+                p50_sum += p50;
+                p99_sum += p99;
+                in_tput_sum += in_tput;
+                out_tput_sum += out_tput;
+                num_samples += 1;
+            }
         }
+
+        avg_pkts_sum /= num_samples;
+        p50_sum /= num_samples;
+        p99_sum /= num_samples;
+        in_tput_sum /= num_samples;
+        out_tput_sum /= num_samples;
+        printf(
+            "%s %.1lf %.3lf %.3lf %.2lf %.2lf\n",
+            name.c_str(), avg_pkts_sum, p50_sum, p99_sum, in_tput_sum, out_tput_sum
+        );
     }
 };
 
@@ -347,14 +378,16 @@ void do_ping(Monitor::SocketPtr sock) {
 
 void do_push(Monitor::SocketPtr sock) {
     std::thread([&] {
-        while (true) {
-            auto p = (Packet *)sock->read(sizeof(Packet));
-            if (p->size > sizeof(Packet))
-                sock->read(p->size - sizeof(Packet));
-            __u64 begin_ts = p->ts;
-            __u64 end_ts = get_ts();
-            mon.latency.add(end_ts - begin_ts);
-        }
+        try {
+            while (true) {
+                auto p = (Packet *)sock->read(sizeof(Packet));
+                if (p->size > sizeof(Packet))
+                    sock->read(p->size - sizeof(Packet));
+                __u64 begin_ts = p->ts;
+                __u64 end_ts = get_ts();
+                mon.latency.add(end_ts - begin_ts);
+            }
+        } catch (...) {}
     }).detach();
 
     while (true) {
@@ -375,7 +408,7 @@ void do_echo(Monitor::SocketPtr sock) {
 
         auto p = (Packet *)sock->read(sizeof(Packet));
         if (p->size > sizeof(Packet))
-            sock->read(sizeof(Packet) - p->size);
+            sock->read(p->size - sizeof(Packet));
 
         if (sleep_ms > 0)
             usleep(sleep_ms * 1000);
@@ -392,23 +425,16 @@ void do_echo(Monitor::SocketPtr sock) {
     }
 }
 
-void exit_handler() {
-    puts("Exiting...");
+void signal_handler(int sig) {
+    printf("Received signal=%d\n", sig);
     mon.finalize();
-}
-
-void signal_handler(int) {
-    safe_exit(0);
+    exit(0);
 }
 
 int main(int argc, char *argv[]) {
-    atexit(exit_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
-
-    auto env_hook_str = getenv("HOOK");
-    if (env_hook_str)
-        env_hook = atoi(env_hook_str);
+    signal(SIGPIPE, SIG_IGN);
 
     if (argc < 6) {
         fprintf(stderr, "%s client/server [count] push/echo [packet size] [address]:[port] [sleep_ms]\n", argv[0]);
@@ -485,6 +511,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Failed to create socket. errno=%d\n", errno);
             return -1;
         }
+        mon.fds.push_back(sock);
 
         if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             fprintf(stderr, "Failed to bind to %s:%d. errno=%d\n", address, port, errno);
@@ -499,6 +526,8 @@ int main(int argc, char *argv[]) {
         puts("Ready to accept connections");
     }
 
+    std::vector<std::thread> workers;
+    workers.reserve(count);
     for (int i = 0; i < count; i++) {
         int conn = -1;
         if (is_client) {
@@ -525,15 +554,19 @@ int main(int argc, char *argv[]) {
             printf("Connection #%d from %s:%d\n", i + 1, inet_ntoa(addr.sin_addr), addr.sin_port);
         }
 
-        int flag = 1;
-        if (setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
+        int value = 1;
+        if (setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) < 0)
             fprintf(stderr, "Failed to set TCP_NODELAY. errno=%d\n", errno);
-        }
-        // if (setsockopt(sock, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) < 0) {
+        // if (setsockopt(sock, IPPROTO_TCP, TCP_QUICKACK, &value, sizeof(value)) < 0)
         //     fprintf(stderr, "Failed to set TCP_QUICKACK. errno=%d\n", errno);
-        // }
+        struct linger linger_opts {
+            .l_onoff = 1,
+            .l_linger = 0,
+        };
+        if (setsockopt(conn, SOL_SOCKET, SO_LINGER, &linger_opts, sizeof(linger_opts)) < 0)
+            fprintf(stderr, "Failed to set SO_LINGER. errno=%d\n", errno);
 
-        std::thread([&, conn] {
+        workers.emplace_back([&, conn] {
             auto sock = mon.attach(conn);
 
             {
@@ -541,16 +574,16 @@ int main(int argc, char *argv[]) {
                 cv.wait(lock, [&] { return flag; });
             }
 
-            if (is_push)
-                do_push(sock);
-            else if (is_ping)
-                do_ping(sock);
-            else
-                do_echo(sock);
-        }).detach();
+            try {
+                if (is_push)
+                    do_push(sock);
+                else if (is_ping)
+                    do_ping(sock);
+                else
+                    do_echo(sock);
+            } catch (...) {};
+        });
     }
-
-    close(sock);
 
     {
         std::unique_lock<std::mutex> lock(mtx);
@@ -559,7 +592,16 @@ int main(int argc, char *argv[]) {
     cv.notify_all();
 
     puts("Benchmark started");
-    mon.main();
+    std::stringstream ss;
+    ss << argv[1] << "-" << argv[3] << "-t" << argv[2] << "-sz" << packet_size;
+    mon.run(15, ss.str());
+
+    puts("Benchmark stopped");
+    mon.finalize();
+
+    for (auto &t : workers) {
+        t.join();
+    }
 
     return 0;
 }

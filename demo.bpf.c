@@ -10,6 +10,8 @@
 
 #include "defines.h"
 
+#define TCP_MAP_SIZE 1024
+
 static inline int parse_header(struct tcphdr **out_tcp, struct tcp_key *out_key, struct __sk_buff *skb) {
     struct ethhdr *eth;
     struct iphdr *ip;
@@ -48,18 +50,10 @@ static inline int parse_header(struct tcphdr **out_tcp, struct tcp_key *out_key,
 SEC(".maps")
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
+    __uint(max_entries, TCP_MAP_SIZE * 2);  // To record sequence numbers for both direction
     __type(key, struct tcp_key);
     __type(value, __u32);
 } syn_map;
-
-SEC(".maps")
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, struct tcp_key);
-    __type(value, __u32);
-} ack_map;
 
 SEC("tc")
 int ingress_main(struct __sk_buff *skb) {
@@ -77,6 +71,8 @@ out:
     return TC_ACT_OK;
 }
 
+__u32 ack_map[TCP_MAP_SIZE];
+
 SEC("tc")
 int egress_main(struct __sk_buff *skb) {
     struct tcphdr *tcp;
@@ -89,10 +85,11 @@ int egress_main(struct __sk_buff *skb) {
         bpf_map_update_elem(&syn_map, &key, &v, BPF_ANY);
     }
 
-    __u32 *ack_seq;
-    if (tcp->ack && (ack_seq = bpf_map_lookup_elem(&ack_map, &key))) {
+    __u32 index = ~skb->mark;
+    if (tcp->ack && index < TCP_MAP_SIZE) {
+        __u32 ack_seq = ack_map[index];
         __u32 offset = (__u32)(__u64)tcp - skb->data + offsetof(struct tcphdr, ack_seq);
-        __u32 value = bpf_htonl(*ack_seq);
+        __u32 value = bpf_htonl(ack_seq);
         bpf_skb_store_bytes(skb, offset, &value, sizeof(value), BPF_F_RECOMPUTE_CSUM);
     }
 

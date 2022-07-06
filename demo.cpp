@@ -62,6 +62,7 @@ struct Monitor {
         struct tcp_key egress_key;
 #endif
         int fd;
+        __u32 index;
         __u32 initial_ack_seq = 0;
         __u32 num_bytes_read = 0;
         size_t beg = 0, end = 0;
@@ -69,23 +70,18 @@ struct Monitor {
 
 #ifndef DEMO_NO_BPF
         void set_ack_seq(__u32 ack_seq) {
-            int ret = 0;
-            do {
-                ret = bpf_map__update_elem(
-                    mon.skel->maps.ack_map, &egress_key, sizeof(egress_key), &ack_seq, sizeof(ack_seq), BPF_ANY
-                );
-            } while (ret == -EBUSY);
-            if (ret < 0) {
-                fprintf(stderr, "Failed to set ack sequence number. errno=%d\n", errno);
-                throw std::runtime_error("set_ack_seq");
-            }
+            mon.skel->bss->ack_map[index] = ack_seq;
         }
 #endif
 
-        Socket(Monitor &_mon, int _fd) : mon(_mon), fd(_fd) {
+        Socket(Monitor &_mon, int _fd, __u32 _index) : mon(_mon), fd(_fd), index(_index) {
             buffer.resize(initial_buffer_size);
 
 #ifndef DEMO_NO_BPF
+            __u32 mark = ~index;
+            if (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0)
+                fprintf(stderr, "Failed to set socket mark. errno=%d\n", errno);
+
             struct sockaddr_in addr;
             socklen_t len = sizeof(addr);
             getpeername(fd, (struct sockaddr *)&addr, &len);
@@ -142,6 +138,7 @@ struct Monitor {
                 buffer.resize(new_size);
             }
 
+            bool updated = false;
             while (size > end - beg) {
                 int ret = recv(fd, buffer.data() + end, buffer.size() - end, 0);
                 if (ret < 0)
@@ -151,16 +148,14 @@ struct Monitor {
                     throw std::runtime_error("recv: shutdown");
                 end += ret;
                 num_bytes_read += ret;
+                updated = true;
             }
 
             const void *ptr = buffer.data() + beg;
             beg += size;
-            // num_bytes_read += size;
 #ifndef DEMO_NO_BPF
-            __u32 new_ack_seq;
-            if (__builtin_uadd_overflow(initial_ack_seq, num_bytes_read, &new_ack_seq))
-                fprintf(stderr, "Ack sequence number wrapped around\n");
-            set_ack_seq(new_ack_seq);
+            if (updated)
+                set_ack_seq(initial_ack_seq + num_bytes_read);
 #endif
             mon.inbound_acc.fetch_add(size, std::memory_order_relaxed);
             return ptr;
@@ -217,6 +212,7 @@ struct Monitor {
         skel = demo::open();
         if (!skel)
             fatal("Failed to open BPF prgoram. errno=%d\n", errno);
+        memset(skel->bss->ack_map, 0, sizeof(skel->bss->ack_map));
         if (demo::load(skel) < 0)
             fatal("Failed to load BPF program. errno=%d\n", errno);
 
@@ -265,7 +261,7 @@ struct Monitor {
     }
 
     auto attach(int fd) -> SocketPtr {
-        socks.push_back(std::make_shared<Socket>(*this, fd));
+        socks.push_back(std::make_shared<Socket>(*this, fd, socks.size()));
         return socks.back();
     }
 

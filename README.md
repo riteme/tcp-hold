@@ -35,6 +35,12 @@ See `demo.cpp` and `demo.bpf.c`.
 
 ## Notes
 
+- `BPF_PROG_TYPE_SOCK_OPS`
+
+https://lwn.net/Articles/727189/
+
+https://arthurchiao.art/blog/bpf-advanced-notes-1-zh/#2-bpf_prog_type_sock_ops
+
 - TCP timed-wait && SIGPIPE
 
 设置 `SO_LINGER` 可以强制发送 `RST` 而不是常规的 `FIN`，避免 TCP 连接进入 timed-wait 状态。

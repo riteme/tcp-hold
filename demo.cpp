@@ -54,7 +54,7 @@ struct Monitor {
 #endif
 
     struct Socket {
-        static constexpr size_t initial_buffer_size = 4096;
+        static constexpr size_t initial_buffer_size = 65536;
 
         Monitor &mon;
 #ifndef DEMO_NO_BPF
@@ -170,12 +170,16 @@ struct Monitor {
     using SocketPtr = std::shared_ptr<Socket>;
 
     struct Histogram {
-        static constexpr int num_buckets = 65536;
-        static constexpr int bucket_width = 256;
+        static constexpr int num_buckets = 131072;
+        static constexpr int bucket_width = 128;
 
+        std::atomic<__u64> sum;
+        std::atomic<__u64> num_samples;
         std::atomic<__u64> bucket[num_buckets];
 
         void add(__u64 latency) {
+            sum.fetch_add(latency, std::memory_order_relaxed);
+            num_samples.fetch_add(1, std::memory_order_relaxed);
             __u64 i = latency / bucket_width;
             if (i >= num_buckets)
                 fprintf(stderr, "Warning: latency=%llu is too large\n", latency);
@@ -266,81 +270,77 @@ struct Monitor {
     }
 
     void run(int num_iters, const std::string &name) {
-        double ts_0, ts_1, ts_2;
-        __u64 acc[latency.num_buckets + 1], delta[latency.num_buckets + 1];
-        __u64 inbound_acc_1, inbound_acc_2;
-        __u64 outbound_acc_1, outbound_acc_2;
+        double ts_0 = 0, ts_1 = 0, ts_2 = 0;
+        __u64 sum_1 = 0, sum_2 = 0;
+        __u64 num_samples_1 = 0, num_samples_2 = 0;
+        __u64 inbound_acc_1 = 0, inbound_acc_2 = 0;
+        __u64 outbound_acc_1 = 0, outbound_acc_2 = 0;
         auto fetch = [&] {
             ts_1 = ts_2;
             ts_2 = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now().time_since_epoch()
             ).count();
-            latency.dump(acc, delta);
+            sum_1 = sum_2;
+            sum_2 = latency.sum.load(std::memory_order_relaxed);
+            num_samples_1 = num_samples_2;
+            num_samples_2 = latency.num_samples.load(std::memory_order_relaxed);
             inbound_acc_1 = inbound_acc_2;
-            inbound_acc_2 = inbound_acc.load();
+            inbound_acc_2 = inbound_acc.load(std::memory_order_relaxed);
             outbound_acc_1 = outbound_acc_2;
-            outbound_acc_2 = outbound_acc.load();
+            outbound_acc_2 = outbound_acc.load(std::memory_order_relaxed);
         };
 
         fetch();
         ts_0 = ts_2;
-        double avg_pkts_sum = 0;
-        double p50_sum = 0;
-        double p99_sum = 0;
+        double num_pkts = 0;
         double in_tput_sum = 0;
         double out_tput_sum = 0;
-        double num_samples = 0;
+        double duration = 0;
+        __u64 acc[latency.num_buckets + 1], delta[latency.num_buckets + 1];
         for (int t = 0; t < num_iters; t++) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
 
-            auto begin_ts = get_ts();
-
             fetch();
-            double n = delta[latency.num_buckets - 1];
-            double avg_pkts = n / (ts_2 - ts_1);
-            double in_tput = (inbound_acc_2 - inbound_acc_1) / (ts_2 - ts_1) / 1024;
-            double out_tput = (outbound_acc_2 - outbound_acc_1) / (ts_2 - ts_1) / 1024;
-
-            double p50 = NAN, p99 = NAN;
-            for (int i = 0; i < latency.num_buckets; i++) {
-                // if (delta[i + 1] - delta[i] > 0)
-                //     printf("[%d] = %llu\n", i, delta[i + 1]);
-                double lp = delta[i] / n;
-                double rp = delta[i + 1] / n;
-                if (lp < 0.5 && 0.5 <= rp)
-                    p50 = i * latency.bucket_width + latency.bucket_width * (0.5 - lp) / (rp - lp);
-                if (lp < 0.99 && 0.99 <= rp)
-                    p99 = i * latency.bucket_width + latency.bucket_width * (0.99 - lp) / (rp - lp);
-            }
-            p50 /= 1000;
-            p99 /= 1000;
-
-            auto end_ts = get_ts();
-            // printf("Computed in %llu μs\n", end_ts - begin_ts);
+            double n = num_samples_2 - num_samples_1;
+            double d = ts_2 - ts_1;
+            double avg_pkts = n / d;
+            double avg_lat = (sum_2 - sum_1) / n / 1000;
+            double in_tput = (inbound_acc_2 - inbound_acc_1) / d / 1024;
+            double out_tput = (outbound_acc_2 - outbound_acc_1) / d / 1024;
 
             printf(
-                "[%.1lfs] %.1lf pkts/s, p50 %.3lf ms, p99 %.3lf ms, in %.3lf KiB/s, out %.3lf KiB/s\n",
-                ts_2 - ts_0, avg_pkts, p50, p99, in_tput, out_tput
+                "[%.1lfs]\t%.1lf pkts/s\tavg %.3lf ms\tin %.3lf KiB/s\tout %.3lf KiB/s\n",
+                ts_2 - ts_0, avg_pkts, avg_lat, in_tput, out_tput
             );
 
-            if (t >= 5 && t + 5 < num_iters) {
-                avg_pkts_sum += avg_pkts;
-                p50_sum += p50;
-                p99_sum += p99;
-                in_tput_sum += in_tput;
-                out_tput_sum += out_tput;
-                num_samples += 1;
+            if (t == 4 || t + 6 == num_iters) {
+                num_pkts = num_samples_2 - num_pkts;
+                in_tput_sum = inbound_acc_2 - in_tput_sum;
+                out_tput_sum = outbound_acc_2 - out_tput_sum;
+                duration = ts_2 - duration;
+                latency.dump(acc, delta);
             }
         }
 
-        avg_pkts_sum /= num_samples;
-        p50_sum /= num_samples;
-        p99_sum /= num_samples;
-        in_tput_sum /= num_samples;
-        out_tput_sum /= num_samples;
+        double p50 = NAN, p99 = NAN;
+        double n = delta[latency.num_buckets];
+        for (int i = 0; i < latency.num_buckets; i++) {
+            // if (delta[i + 1] - delta[i] > 0)
+            //     printf("[%d] = %llu\n", i, delta[i + 1]);
+            double lp = delta[i] / n;
+            double rp = delta[i + 1] / n;
+            if (lp < 0.5 && 0.5 <= rp)
+                p50 = i * latency.bucket_width + latency.bucket_width * (0.5 - lp) / (rp - lp);
+            if (lp < 0.99 && 0.99 <= rp)
+                p99 = i * latency.bucket_width + latency.bucket_width * (0.99 - lp) / (rp - lp);
+        }
+
+        num_pkts /= duration;
+        in_tput_sum /= duration;
+        out_tput_sum /= duration;
         printf(
-            "%s %.1lf %.3lf %.3lf %.2lf %.2lf\n",
-            name.c_str(), avg_pkts_sum, p50_sum, p99_sum, in_tput_sum, out_tput_sum
+            "%s %.1lf %.3lf %.3lf %.3lf %.3lf\n",
+            name.c_str(), num_pkts, p50 / 1000, p99 / 1000, in_tput_sum / 1024, out_tput_sum / 1024
         );
     }
 };

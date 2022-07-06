@@ -62,7 +62,7 @@ struct Monitor {
         struct tcp_key egress_key;
 #endif
         int fd;
-        __u32 initial_recv_seq = 0;
+        __u32 initial_ack_seq = 0;
         __u32 num_bytes_read = 0;
         size_t beg = 0, end = 0;
         std::vector<__u8> buffer;
@@ -100,7 +100,7 @@ struct Monitor {
                     mon.skel->maps.syn_map, &ingress_key, sizeof(ingress_key), &v, sizeof(v), 0
                 ) < 0)
                 fatal("Failed to get initial recv sequence number. errno=%d\n", errno);
-            initial_recv_seq = v;
+            initial_ack_seq = v + 1;
             // printf("initial_recv_seq=%u\n", initial_recv_seq);
 
             egress_key = ingress_key;
@@ -108,7 +108,7 @@ struct Monitor {
             std::swap(egress_key.sport, egress_key.dport);
             bpf_map__delete_elem(mon.skel->maps.syn_map, &egress_key, sizeof(egress_key), 0);
 
-            set_ack_seq(initial_recv_seq + 1);
+            set_ack_seq(initial_ack_seq);
 #endif
         }
 
@@ -150,13 +150,17 @@ struct Monitor {
                 if (ret == 0)
                     throw std::runtime_error("recv: shutdown");
                 end += ret;
+                num_bytes_read += ret;
             }
 
             const void *ptr = buffer.data() + beg;
             beg += size;
-            num_bytes_read += size;
+            // num_bytes_read += size;
 #ifndef DEMO_NO_BPF
-            set_ack_seq(initial_recv_seq + num_bytes_read);
+            __u32 new_ack_seq;
+            if (__builtin_uadd_overflow(initial_ack_seq, num_bytes_read, &new_ack_seq))
+                fprintf(stderr, "Ack sequence number wrapped around\n");
+            set_ack_seq(new_ack_seq);
 #endif
             mon.inbound_acc.fetch_add(size, std::memory_order_relaxed);
             return ptr;
@@ -167,7 +171,7 @@ struct Monitor {
 
     struct Histogram {
         static constexpr int num_buckets = 65536;
-        static constexpr int bucket_width = 1;
+        static constexpr int bucket_width = 256;
 
         std::atomic<__u64> bucket[num_buckets];
 
@@ -294,8 +298,8 @@ struct Monitor {
             fetch();
             double n = delta[latency.num_buckets - 1];
             double avg_pkts = n / (ts_2 - ts_1);
-            double in_tput = (inbound_acc_2 - inbound_acc_1) / (ts_2 - ts_1) / 1024 / 1024;
-            double out_tput = (outbound_acc_2 - outbound_acc_1) / (ts_2 - ts_1) / 1024 / 1024;
+            double in_tput = (inbound_acc_2 - inbound_acc_1) / (ts_2 - ts_1) / 1024;
+            double out_tput = (outbound_acc_2 - outbound_acc_1) / (ts_2 - ts_1) / 1024;
 
             double p50 = NAN, p99 = NAN;
             for (int i = 0; i < latency.num_buckets; i++) {
@@ -312,10 +316,10 @@ struct Monitor {
             p99 /= 1000;
 
             auto end_ts = get_ts();
-            printf("Computed in %llu μs\n", end_ts - begin_ts);
+            // printf("Computed in %llu μs\n", end_ts - begin_ts);
 
             printf(
-                "[%.1lfs] %.1lf pkts/s, p50 %.3lf ms, p99 %.3lf ms, in %.2lf MiB/s, out %.2lf MiB/s\n",
+                "[%.1lfs] %.1lf pkts/s, p50 %.3lf ms, p99 %.3lf ms, in %.3lf KiB/s, out %.3lf KiB/s\n",
                 ts_2 - ts_0, avg_pkts, p50, p99, in_tput, out_tput
             );
 
@@ -437,7 +441,7 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
 
     if (argc < 6) {
-        fprintf(stderr, "%s client/server [count] push/echo [packet size] [address]:[port] [sleep_ms]\n", argv[0]);
+        fprintf(stderr, "%s client/server [count] ping/push/echo [packet size] [address]:[port] [sleep_ms]\n", argv[0]);
         return -1;
     }
 
@@ -591,10 +595,16 @@ int main(int argc, char *argv[]) {
     }
     cv.notify_all();
 
+    int env_count = 20;
+    const char *count_str = getenv("COUNT");
+    if (count_str)
+        env_count = atoi(count_str);
+
     puts("Benchmark started");
     std::stringstream ss;
+    ss << argv[0] << "\t";
     ss << argv[1] << "-" << argv[3] << "-t" << argv[2] << "-sz" << packet_size;
-    mon.run(15, ss.str());
+    mon.run(env_count, ss.str());
 
     puts("Benchmark stopped");
     mon.finalize();

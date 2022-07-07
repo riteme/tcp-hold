@@ -9,18 +9,20 @@
 
 Server:
 
-```
-make
-./demo server 32 ping 16 0.0.0.0:23324
+```bash
+make demo-nobpf
+export COUNT=60
+./demo-nobpf server 32 ping 16 0.0.0.0:23324
 ```
 
 Client:
 
-```
+```bash
 sudo ./net-up.sh
 sudo ip netns exec ns0 sudo -u $(whoami) bash
-make
-sudo HOOK=1 ./demo client 32 echo 16 192.168.100.100:23324
+make demo
+export COUNT=60
+sudo -E ./demo client 32 echo 16 192.168.100.100:23324
 ```
 
 See `demo.cpp` and `demo.bpf.c`.
@@ -28,18 +30,30 @@ See `demo.cpp` and `demo.bpf.c`.
 ## TODO
 
 - [ ] Request latency
-- [ ] Request hroughput
+- [ ] Request throughput
+- [ ] Stream throughput (and deviation)
 - [ ] #TCP-retransmission
 - [ ] Syscall latency
 - [ ] CPU usage
 
 ## Notes
 
+- ACK thinning
+
+<https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.526.8062&rep=rep1&type=pdf>
+
+- 如何主动触发 ack？
+
+1. 利用退出 `TCP_REPAIR` 模式的 `tcp_send_window_probe`：<https://elixir.bootlin.com/linux/v5.18.9/source/net/ipv4/tcp.c#L3506>
+2. 利用 BPF helper：`bpf_tcp_send_ack`
+
+主要问题在于 BPF 程序是事件触发的
+
 - `BPF_PROG_TYPE_SOCK_OPS`
 
-https://lwn.net/Articles/727189/
+<https://lwn.net/Articles/727189/>
 
-https://arthurchiao.art/blog/bpf-advanced-notes-1-zh/#2-bpf_prog_type_sock_ops
+<https://arthurchiao.art/blog/bpf-advanced-notes-1-zh/#2-bpf_prog_type_sock_ops>
 
 - TCP timed-wait && SIGPIPE
 
@@ -53,7 +67,7 @@ https://arthurchiao.art/blog/bpf-advanced-notes-1-zh/#2-bpf_prog_type_sock_ops
 
 - WLAN packet
 
-https://wiki.wireshark.org/CaptureSetup/WLAN
+<https://wiki.wireshark.org/CaptureSetup/WLAN>
 
 > Link-Layer (Radio) packet headers
 >
@@ -65,7 +79,7 @@ https://wiki.wireshark.org/CaptureSetup/WLAN
 
 - libbpf tc 支持
 
-https://patchwork.kernel.org/project/netdevbpf/patch/20210512103451.989420-3-memxor@gmail.com/
+<https://patchwork.kernel.org/project/netdevbpf/patch/20210512103451.989420-3-memxor@gmail.com/>
 
 - 在新的 netns 内无法使用 `ping`，`ping` 没有任何输出就退出
 
@@ -73,17 +87,17 @@ https://patchwork.kernel.org/project/netdevbpf/patch/20210512103451.989420-3-mem
 
 无法使用 `ping` 是因为没有权限。新 netns 内 `net.ipv4.ping_group_range` 没有被正确设置。参见：
 
-https://fedoraproject.org/wiki/Changes/EnableSysctlPingGroupRange
+<https://fedoraproject.org/wiki/Changes/EnableSysctlPingGroupRange>
 
-https://unix.stackexchange.com/questions/608866/ping-inside-netns-requires-sudo-fedora
+<https://unix.stackexchange.com/questions/608866/ping-inside-netns-requires-sudo-fedora>
 
 - IPTables
 
-https://www.booleanworld.com/depth-guide-iptables-linux-firewall/
+<https://www.booleanworld.com/depth-guide-iptables-linux-firewall/>
 
 - qdisc plug
 
-https://github.com/thom311/libnl/blob/main/lib/cli/qdisc/plug.c
+<https://github.com/thom311/libnl/blob/main/lib/cli/qdisc/plug.c>
 
 ```python
 import os

@@ -12,7 +12,12 @@
 
 #define TCP_MAP_SIZE 1024
 
-static inline int parse_header(struct tcphdr **out_tcp, struct tcp_key *out_key, struct __sk_buff *skb) {
+static inline int parse_header(
+    struct tcphdr **out_tcp,
+    struct tcp_key *out_key,
+    __u32 *out_payload_size,
+    struct __sk_buff *skb
+) {
     struct ethhdr *eth;
     struct iphdr *ip;
     struct tcphdr *tcp;
@@ -44,6 +49,8 @@ static inline int parse_header(struct tcphdr **out_tcp, struct tcp_key *out_key,
         out_key->daddr = ip->daddr;
         out_key->dport = tcp->dest;
     }
+    if (out_payload_size)
+        *out_payload_size = bpf_ntohs(ip->tot_len) - (ip->ihl + tcp->doff) * sizeof(__u32);
     return 0;
 }
 
@@ -55,11 +62,15 @@ struct {
     __type(value, __u32);
 } syn_map;
 
+__u32 last_seq[TCP_MAP_SIZE];
+__u32 last_ack[TCP_MAP_SIZE];
+__u32 curr_ack[TCP_MAP_SIZE];
+
 SEC("tc")
 int ingress_main(struct __sk_buff *skb) {
     struct tcphdr *tcp;
     struct tcp_key key = {0};
-    if (parse_header(&tcp, &key, skb) < 0)
+    if (parse_header(&tcp, &key, NULL, skb) < 0)
         goto out;
 
     if (tcp->syn) {
@@ -71,13 +82,16 @@ out:
     return TC_ACT_OK;
 }
 
-__u32 ack_map[TCP_MAP_SIZE];
+static inline int seq_num_less(__u32 a, __u32 b) {
+    return b - a < (1u << 31);
+}
 
 SEC("tc")
 int egress_main(struct __sk_buff *skb) {
     struct tcphdr *tcp;
-    struct tcp_key key = {0};
-    if (parse_header(&tcp, &key, skb) < 0)
+    struct tcp_key key;
+    __u32 payload_size;
+    if (parse_header(&tcp, &key, &payload_size, skb) < 0)
         goto out;
 
     if (tcp->syn) {
@@ -85,13 +99,37 @@ int egress_main(struct __sk_buff *skb) {
         bpf_map_update_elem(&syn_map, &key, &v, BPF_ANY);
     }
 
-    __u32 index = ~skb->mark;
-    if (tcp->ack && index < TCP_MAP_SIZE) {
-        __u32 ack_seq = ack_map[index];
-        __u32 offset = (__u32)(__u64)tcp - skb->data + offsetof(struct tcphdr, ack_seq);
+    __u32 i = ~skb->mark;
+    if (i >= TCP_MAP_SIZE)
+        goto out;
+
+    __u32 curr_seq = bpf_ntohl(tcp->seq);
+    __u32 next_seq = curr_seq + payload_size;
+    int is_keepalive = (payload_size == 0 && curr_seq == last_seq[i] - 1);
+
+    if (tcp->ack) {
+        __u32 ack_seq = curr_ack[i];
+        if (ack_seq != last_ack[i])
+            last_ack[i] = ack_seq;
+        else if (payload_size == 0)
+            return TC_ACT_SHOT;
+
+        __u32 off = (__u32)(__u64)tcp - skb->data;
         __u32 value = bpf_htonl(ack_seq);
-        bpf_skb_store_bytes(skb, offset, &value, sizeof(value), BPF_F_RECOMPUTE_CSUM);
+        bpf_skb_store_bytes(
+            skb, off + offsetof(struct tcphdr, ack_seq), &value, sizeof(value), BPF_F_RECOMPUTE_CSUM
+        );
+
+        if (is_keepalive) {
+            value = bpf_htonl(last_seq[i]);
+            bpf_skb_store_bytes(
+                skb, off + offsetof(struct tcphdr, seq), &value, sizeof(value), BPF_F_RECOMPUTE_CSUM
+            );
+        }
     }
+
+    if (seq_num_less(last_seq[i], next_seq))
+        last_seq[i] = next_seq;
 
 out:
     return TC_ACT_OK;

@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cstdlib>
 
+#include <map>
 #include <list>
 #include <queue>
 #include <atomic>
@@ -69,8 +70,18 @@ struct Monitor {
         std::vector<__u8> buffer;
 
 #ifndef DEMO_NO_BPF
+        void send_keepalive() {
+            int flag = TCP_REPAIR_OFF;
+            if (setsockopt(fd, SOL_TCP, TCP_REPAIR, &flag, sizeof(flag)) < 0)
+                fprintf(stderr, "Failed to turn off TCP_REPAIR. errno=%d\n", errno);
+        }
+
+        bool can_send_ack() {
+            return mon.skel->bss->last_ack[index] != mon.skel->bss->curr_ack[index];
+        }
+
         void set_ack_seq(__u32 ack_seq) {
-            mon.skel->bss->ack_map[index] = ack_seq;
+            mon.skel->bss->curr_ack[index] = ack_seq;
         }
 #endif
 
@@ -102,8 +113,14 @@ struct Monitor {
             egress_key = ingress_key;
             std::swap(egress_key.saddr, egress_key.daddr);
             std::swap(egress_key.sport, egress_key.dport);
-            bpf_map__delete_elem(mon.skel->maps.syn_map, &egress_key, sizeof(egress_key), 0);
+            if (bpf_map__lookup_and_delete_elem(
+                    mon.skel->maps.syn_map, &egress_key, sizeof(egress_key), &v, sizeof(v), 0
+                ) < 0)
+                fatal("Failed to get initial send sequence number. errno=%d\n", errno);
+            mon.skel->bss->last_seq[index] = v + 1;
+            // printf("%u\n", v + 1);
 
+            mon.skel->bss->last_ack[index] = initial_ack_seq;
             set_ack_seq(initial_ack_seq);
 #endif
         }
@@ -121,6 +138,11 @@ struct Monitor {
         }
 
         auto read(size_t size) -> const void * {
+#ifndef DEMO_NO_BPF
+            if (can_send_ack())
+                send_keepalive();
+#endif
+
             // Not at front && no enough space
             if (beg > 0 && size > buffer.size() - beg) {
                 // Non-empty
@@ -212,7 +234,11 @@ struct Monitor {
         skel = demo::open();
         if (!skel)
             fatal("Failed to open BPF prgoram. errno=%d\n", errno);
-        memset(skel->bss->ack_map, 0, sizeof(skel->bss->ack_map));
+
+        memset(skel->bss->last_seq, 0, sizeof(skel->bss->last_seq));
+        memset(skel->bss->last_ack, 0, sizeof(skel->bss->last_ack));
+        memset(skel->bss->curr_ack, 0, sizeof(skel->bss->curr_ack));
+
         if (demo::load(skel) < 0)
             fatal("Failed to load BPF program. errno=%d\n", errno);
 
@@ -244,7 +270,9 @@ struct Monitor {
     void finalize() {
         for (auto &sock : socks) {
             shutdown(sock->fd, SHUT_RDWR);
-            close(sock->fd);
+            int fd;
+            std::swap(fd, sock->fd);
+            close(fd);
         }
         for (int fd : fds) {
             close(fd);
@@ -348,7 +376,7 @@ struct Packet {
 };
 
 __u64 packet_size;
-int sleep_ms = 10;
+int sleep_ms = 0;
 std::vector<__u8> pad;
 Monitor mon;
 
@@ -402,6 +430,13 @@ void do_push(Monitor::SocketPtr sock) {
     }
 }
 
+void do_pull(Monitor::SocketPtr sock) {
+    while (true) {
+        sock->read(packet_size);
+        mon.latency.add(0);
+    }
+}
+
 void do_echo(Monitor::SocketPtr sock) {
     while (true) {
         auto begin_ts = get_ts();
@@ -437,7 +472,7 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
 
     if (argc < 6) {
-        fprintf(stderr, "%s client/server [count] ping/push/echo [packet size] [address]:[port] [sleep_ms]\n", argv[0]);
+        fprintf(stderr, "%s client/server [count] [handler] [packet size] [address]:[port] [sleep_ms]\n", argv[0]);
         return -1;
     }
 
@@ -453,15 +488,17 @@ int main(int argc, char *argv[]) {
 
     int count = atoi(argv[2]);
 
-    bool is_push = false, is_ping = false;
-    if (strcmp(argv[3], "push") == 0)
-        is_push = true;
-    else if (strcmp(argv[3], "ping") == 0)
-        is_ping = true;
-    else if (strcmp(argv[3], "echo") != 0) {
+    std::map<std::string, decltype(&do_ping)> handlers;
+    handlers["ping"] = do_ping;
+    handlers["push"] = do_push;
+    handlers["echo"] = do_echo;
+    handlers["pull"] = do_pull;
+    auto handler_iter = handlers.find(argv[3]);
+    if (handler_iter == handlers.end()) {
         fprintf(stderr, "Second CLI argument is invalid\n");
         return -1;
     }
+    auto handler = handler_iter->second;
 
     packet_size = atoi(argv[4]);
     if (packet_size < sizeof(Packet)) {
@@ -493,8 +530,8 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    if (!is_push && !is_ping)
-        sleep_ms = 0;
+    if (handler_iter->first == "push")
+        sleep_ms = 10;
     if (argc > 6)
         sleep_ms = atoi(argv[6]);
 
@@ -566,7 +603,7 @@ int main(int argc, char *argv[]) {
         if (setsockopt(conn, SOL_SOCKET, SO_LINGER, &linger_opts, sizeof(linger_opts)) < 0)
             fprintf(stderr, "Failed to set SO_LINGER. errno=%d\n", errno);
 
-        workers.emplace_back([&, conn] {
+        workers.emplace_back([&, conn, handler_iter] {
             auto sock = mon.attach(conn);
 
             {
@@ -575,12 +612,7 @@ int main(int argc, char *argv[]) {
             }
 
             try {
-                if (is_push)
-                    do_push(sock);
-                else if (is_ping)
-                    do_ping(sock);
-                else
-                    do_echo(sock);
+                handler(sock);
             } catch (...) {};
         });
     }

@@ -111,8 +111,8 @@ int egress_main(struct __sk_buff *skb) {
         __u32 ack_seq = curr_ack[i];
         if (ack_seq != last_ack[i])
             last_ack[i] = ack_seq;
-        else if (payload_size == 0)
-            return TC_ACT_SHOT;
+        // else if (payload_size == 0)
+        //     return TC_ACT_SHOT;
 
         __u32 off = (__u32)(__u64)tcp - skb->data;
         __u32 value = bpf_htonl(ack_seq);

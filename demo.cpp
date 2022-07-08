@@ -76,12 +76,11 @@ struct Monitor {
                 fprintf(stderr, "Failed to turn off TCP_REPAIR. errno=%d\n", errno);
         }
 
-        bool can_send_ack() {
-            return mon.skel->bss->last_ack[index] != mon.skel->bss->curr_ack[index];
-        }
-
-        void set_ack_seq(__u32 ack_seq) {
-            mon.skel->bss->curr_ack[index] = ack_seq;
+        bool update_ack_seq() {
+            __u32 new_ack_seq = initial_ack_seq + num_bytes_read;
+            if (mon.skel->bss->curr_ack[index] != new_ack_seq)
+                mon.skel->bss->curr_ack[index] = new_ack_seq;
+            return mon.skel->bss->last_ack[index] != new_ack_seq;
         }
 #endif
 
@@ -121,7 +120,7 @@ struct Monitor {
             // printf("%u\n", v + 1);
 
             mon.skel->bss->last_ack[index] = initial_ack_seq;
-            set_ack_seq(initial_ack_seq);
+            mon.skel->bss->curr_ack[index] = initial_ack_seq;
 #endif
         }
 
@@ -138,11 +137,6 @@ struct Monitor {
         }
 
         auto read(size_t size) -> const void * {
-#ifndef DEMO_NO_BPF
-            if (can_send_ack())
-                send_keepalive();
-#endif
-
             // Not at front && no enough space
             if (beg > 0 && size > buffer.size() - beg) {
                 // Non-empty
@@ -160,7 +154,6 @@ struct Monitor {
                 buffer.resize(new_size);
             }
 
-            bool updated = false;
             while (size > end - beg) {
                 int ret = recv(fd, buffer.data() + end, buffer.size() - end, 0);
                 if (ret < 0)
@@ -170,15 +163,14 @@ struct Monitor {
                     throw std::runtime_error("recv: shutdown");
                 end += ret;
                 num_bytes_read += ret;
-                updated = true;
+#ifndef DEMO_NO_BPF
+                if (update_ack_seq())
+                    send_keepalive();
+#endif
             }
 
             const void *ptr = buffer.data() + beg;
             beg += size;
-#ifndef DEMO_NO_BPF
-            if (updated)
-                set_ack_seq(initial_ack_seq + num_bytes_read);
-#endif
             mon.inbound_acc.fetch_add(size, std::memory_order_relaxed);
             return ptr;
         }
